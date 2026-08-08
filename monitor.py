@@ -5,17 +5,10 @@ odyssey-watch
 Alerts when Harkins Arizona Mills w/ IMAX posts showtimes for a target film
 beyond a watermark date.
 
-Runs entirely on GitHub's servers. Three modes, chosen from a dropdown in the
-GitHub Actions tab:
-
+Modes (chosen from the dropdown in the GitHub Actions tab):
   check             normal run -- probe for new dates, alert if found
   test-notification send a test push, prove the alert path works
-  diagnose          save the raw page text so the reader can be corrected
-
-Outcomes of a normal run:
-  EXTENDED   -> target film found on a date after the watermark. Loud alert.
-  NO_CHANGE  -> found on the watermark date, nothing after. Silent.
-  ANOMALY    -> not found on the watermark date either. Warning after 2 in a row.
+  diagnose          save raw page text + screenshots for troubleshooting
 """
 
 from __future__ import annotations
@@ -40,24 +33,13 @@ from playwright.sync_api import sync_playwright
 THEATRE_SLUG = os.environ.get("THEATRE_SLUG", "arizona-mills-w-imax")
 BASE_URL = "https://www.harkins.com/theatres/{slug}/{date}"
 
-# Substring match, case-insensitive. Deliberately loose -- Harkins may list
-# this as "The Odyssey", "The Odyssey: The IMAX Experience", etc.
 TITLE_PATTERN = re.compile(os.environ.get("TITLE_PATTERN", r"odyssey"), re.I)
 
-# Empty = alert on ANY format. Set to "IMAX" to require IMAX. Leave empty
-# at first: you want to know the moment anything opens past the watermark.
 _fmt = os.environ.get("FORMAT_PATTERN", "").strip()
 FORMAT_PATTERN = re.compile(_fmt, re.I) if _fmt else None
 
-# The last date currently showing showtimes. Set once; the script raises it
-# automatically after each successful alert.
 DEFAULT_WATERMARK = os.environ.get("WATERMARK", "2026-09-16")
-
-# Days past the watermark to probe. 7 covers a full theatrical week, so a
-# Thursday gap can't hide a Friday extension.
 PROBE_DAYS = int(os.environ.get("PROBE_DAYS", "7"))
-
-# Once an extension is found, how far forward to walk to find the new end.
 HORIZON_SCAN_DAYS = int(os.environ.get("HORIZON_SCAN_DAYS", "45"))
 
 STATE_PATH = Path(os.environ.get("STATE_PATH", "state.json"))
@@ -66,15 +48,20 @@ DIAGNOSTIC_PATH = Path("diagnostic.txt")
 PUSHOVER_TOKEN = os.environ.get("PUSHOVER_TOKEN", "")
 PUSHOVER_USER = os.environ.get("PUSHOVER_USER", "")
 
-USER_AGENT = os.environ.get(
-    "USER_AGENT",
-    "odyssey-watch/1.0 (personal showtime alert)",
-)
+# Timing. We no longer wait for "networkidle" -- commercial sites with
+# analytics and chat widgets never go idle, so that always times out.
+NAV_TIMEOUT_MS = int(os.environ.get("NAV_TIMEOUT_MS", "45000"))
+CONTENT_TIMEOUT_MS = int(os.environ.get("CONTENT_TIMEOUT_MS", "20000"))
+SETTLE_MS = int(os.environ.get("SETTLE_MS", "3000"))
 PAGE_DELAY_SEC = float(os.environ.get("PAGE_DELAY_SEC", "1.5"))
-PAGE_TIMEOUT_MS = int(os.environ.get("PAGE_TIMEOUT_MS", "25000"))
 
 TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\s*(?:am|pm)\b", re.I)
 FORMAT_LABEL_RE = re.compile(r"\b(IMAX(?:\s+\w+)?|Dolby Cinema|CINEXL)\b", re.I)
+
+# Something that looks like a showtime on the page.
+SHOWTIME_SELECTOR = "text=/\\d{1,2}:\\d{2}\\s*(am|pm)/i"
+# Or an explicit "nothing here" message.
+EMPTY_SELECTOR = "text=/no showtimes|not available|check back|coming soon/i"
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +78,10 @@ class DayResult:
     excerpt: str = ""
     full_text: str = ""
     note: str = ""
+    page_title: str = ""
+    html_len: int = 0
+    landed_url: str = ""
+    rendered: bool = False
 
 
 def load_state() -> dict:
@@ -120,41 +111,77 @@ def theatre_url(day: date) -> str:
 # ---------------------------------------------------------------------------
 
 
-def probe_day(page, day: date, keep_full_text: bool = False) -> DayResult:
+def probe_day(page, day: date, keep_full_text: bool = False,
+              screenshot: bool = False) -> DayResult:
     """Load one date's theatre page and look for the target film."""
-    page.goto(theatre_url(day), wait_until="networkidle", timeout=PAGE_TIMEOUT_MS)
+    url = theatre_url(day)
 
-    # Schedule is rendered client-side. networkidle is usually enough; give
-    # slow XHRs one more beat before reading.
-    try:
-        page.wait_for_selector(
-            "text=/showtime|no showtimes|:\\d{2}\\s*(am|pm)/i", timeout=8000
-        )
-    except Exception:
-        pass
+    # Navigate. domcontentloaded fires reliably; networkidle does not.
+    nav_error = None
+    for attempt in (1, 2):
+        try:
+            page.goto(url, wait_until="domcontentloaded",
+                      timeout=NAV_TIMEOUT_MS)
+            nav_error = None
+            break
+        except Exception as exc:  # noqa: BLE001
+            nav_error = exc
+            if attempt == 1:
+                print(f"    {day}: navigation retry after: {exc}")
+                time.sleep(3)
+
+    if nav_error is not None:
+        return DayResult(day=day, found=False,
+                         note=f"navigation failed twice: {nav_error}")
+
+    # Wait for the schedule to actually render, one way or the other.
+    rendered = False
+    for selector, timeout in ((SHOWTIME_SELECTOR, CONTENT_TIMEOUT_MS),
+                              (EMPTY_SELECTOR, 5000)):
+        try:
+            page.wait_for_selector(selector, timeout=timeout)
+            rendered = True
+            break
+        except Exception:
+            continue
+
+    page.wait_for_timeout(SETTLE_MS)
 
     text = page.inner_text("body")
-    full = text if keep_full_text else ""
+    html_len = len(page.content())
+    landed = page.url
+    title = page.title()
 
-    # Harkins bounces unknown/far-future dates back to today. If we didn't
-    # land on the date we asked for, treat it as "not published yet" --
-    # otherwise today's schedule would false-positive.
-    if day.isoformat() not in page.url:
-        return DayResult(day=day, found=False, full_text=full,
-                         note=f"redirected to {page.url}")
+    if screenshot:
+        page.screenshot(path=f"diag-{day.isoformat()}.png", full_page=True)
+
+    base = dict(
+        full_text=text if keep_full_text else "",
+        page_title=title,
+        html_len=html_len,
+        landed_url=landed,
+        rendered=rendered,
+    )
+
+    # Harkins bounces unpublished dates back to today. If we didn't land on
+    # the date we asked for, treat it as "not published yet".
+    if day.isoformat() not in landed:
+        return DayResult(day=day, found=False,
+                         note=f"redirected to {landed}", **base)
 
     match = TITLE_PATTERN.search(text)
     if not match:
-        return DayResult(day=day, found=False, full_text=full,
-                         note="title pattern not present in page text")
+        note = "title not in page text"
+        if not rendered:
+            note += " (and content never rendered -- may be a load problem)"
+        return DayResult(day=day, found=False, note=note, **base)
 
-    # Window of text around the title, to pull times and format labels.
     start = max(0, match.start() - 200)
     window = text[start: match.end() + 900]
 
     if FORMAT_PATTERN and not FORMAT_PATTERN.search(window):
         return DayResult(day=day, found=False, excerpt=window[:400],
-                         full_text=full, note="title found but format filtered out")
+                         note="title found but format filtered out", **base)
 
     return DayResult(
         day=day,
@@ -162,21 +189,27 @@ def probe_day(page, day: date, keep_full_text: bool = False) -> DayResult:
         times=TIME_RE.findall(window),
         formats=sorted(set(FORMAT_LABEL_RE.findall(window))),
         excerpt=window[:600],
-        full_text=full,
+        **base,
     )
 
 
-def scan(days: list[date], keep_full_text: bool = False) -> list[DayResult]:
+def scan(days: list[date], keep_full_text: bool = False,
+         screenshot: bool = False) -> list[DayResult]:
     results: list[DayResult] = []
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = p.chromium.launch(args=["--disable-blink-features=AutomationControlled"])
+        # No custom user agent -- Playwright's default looks like real Chrome,
+        # which it is. Politeness comes from low request volume, not headers.
         ctx = browser.new_context(
-            user_agent=USER_AGENT, viewport={"width": 1280, "height": 2400}
+            viewport={"width": 1440, "height": 2400},
+            locale="en-US",
+            timezone_id="America/Phoenix",
         )
+        ctx.set_default_timeout(NAV_TIMEOUT_MS)
         page = ctx.new_page()
         for d in days:
             try:
-                results.append(probe_day(page, d, keep_full_text))
+                results.append(probe_day(page, d, keep_full_text, screenshot))
             except Exception as exc:  # noqa: BLE001
                 print(f"warn: probe failed for {d}: {exc}", file=sys.stderr)
                 results.append(DayResult(day=d, found=False, note=f"error: {exc}"))
@@ -228,36 +261,35 @@ def mode_test_notify() -> int:
     print("Sending a test notification...")
     if not (PUSHOVER_TOKEN and PUSHOVER_USER):
         print("!! PUSHOVER_TOKEN and/or PUSHOVER_USER are empty.")
-        print("   Check Settings > Secrets and variables > Actions.")
         return 1
-    notify(
-        "Odyssey watch is wired up",
-        "If you're reading this on your phone, the alerting half works. "
-        "Nothing has been detected yet -- this is only a test.",
-        priority=0,
-    )
+    notify("Odyssey watch is wired up",
+           "If you're reading this on your phone, the alerting half works.",
+           priority=0)
     print("Done. Check your phone.")
     return 0
 
 
 def mode_diagnose(watermark: date) -> int:
-    """Capture raw page text so the reader logic can be corrected."""
     probe = watermark + timedelta(days=2)
-    print(f"Diagnosing: {watermark} (should HAVE showtimes) "
+    print(f"Diagnosing {watermark} (should HAVE showtimes) "
           f"and {probe} (should NOT, yet)")
 
-    results = scan([watermark, probe], keep_full_text=True)
+    results = scan([watermark, probe], keep_full_text=True, screenshot=True)
 
     chunks = ["ODYSSEY-WATCH DIAGNOSTIC", f"generated: {datetime.now()}", ""]
     for r in results:
         chunks += [
             "=" * 70,
-            f"DATE:      {r.day}",
-            f"URL:       {theatre_url(r.day)}",
-            f"FOUND:     {r.found}",
-            f"NOTE:      {r.note or '-'}",
-            f"TIMES:     {', '.join(r.times) or '-'}",
-            f"FORMATS:   {', '.join(r.formats) or '-'}",
+            f"DATE:        {r.day}",
+            f"REQUESTED:   {theatre_url(r.day)}",
+            f"LANDED ON:   {r.landed_url or '-'}",
+            f"PAGE TITLE:  {r.page_title or '-'}",
+            f"HTML SIZE:   {r.html_len}",
+            f"RENDERED:    {r.rendered}",
+            f"FOUND:       {r.found}",
+            f"NOTE:        {r.note or '-'}",
+            f"TIMES:       {', '.join(r.times) or '-'}",
+            f"FORMATS:     {', '.join(r.formats) or '-'}",
             "",
             "--- matched window ---",
             r.excerpt or "(nothing matched)",
@@ -266,12 +298,12 @@ def mode_diagnose(watermark: date) -> int:
             (r.full_text or "(empty)")[:15000],
             "",
         ]
-        print(f"  {r.day}: found={r.found} times={len(r.times)} {r.note}")
+        print(f"  {r.day}: found={r.found} rendered={r.rendered} "
+              f"html={r.html_len} note={r.note}")
 
     DIAGNOSTIC_PATH.write_text("\n".join(chunks))
-    print(f"\nWrote {DIAGNOSTIC_PATH} "
-          f"({DIAGNOSTIC_PATH.stat().st_size} bytes). "
-          "Download it from the Artifacts section of this run.")
+    print(f"\nWrote {DIAGNOSTIC_PATH} ({DIAGNOSTIC_PATH.stat().st_size} bytes) "
+          "plus screenshots. Download them from Artifacts.")
     return 0
 
 
@@ -289,7 +321,6 @@ def mode_check(state: dict, notify_enabled: bool) -> dict:
 
     if after:
         last_hit = max(r.day for r in after)
-        # Walk forward a week at a time to find the true new horizon.
         while (last_hit - watermark).days <= HORIZON_SCAN_DAYS:
             chunk = [last_hit + timedelta(days=i) for i in range(1, 8)]
             hits = [r for r in scan(chunk) if r.found]
@@ -301,29 +332,18 @@ def mode_check(state: dict, notify_enabled: bool) -> dict:
         lines = []
         for r in sorted(after, key=lambda x: x.day):
             times = ", ".join(r.times[:12]) or "(times not parsed)"
-            fmts = "/".join(r.formats)
-            lines.append(f"<b>{r.day:%a %b %d}</b> {fmts}\n{times}")
+            lines.append(f"<b>{r.day:%a %b %d}</b> {'/'.join(r.formats)}\n{times}")
 
-        body = (
-            f"New dates are live past {watermark:%b %d}.\n\n"
-            + "\n\n".join(lines)
-            + f"\n\nNew last date: {last_hit:%b %d}"
-        )
+        body = (f"New dates are live past {watermark:%b %d}.\n\n"
+                + "\n\n".join(lines)
+                + f"\n\nNew last date: {last_hit:%b %d}")
         print(f"EXTENDED -> new horizon {last_hit}")
         if notify_enabled:
-            notify(
-                "Odyssey extended - AZ Mills IMAX",
-                body,
-                priority=1,
-                url=theatre_url(min(r.day for r in after)),
-            )
+            notify("Odyssey extended - AZ Mills IMAX", body, priority=1,
+                   url=theatre_url(min(r.day for r in after)))
 
-        state.update(
-            watermark=last_hit.isoformat(),
-            last_alert=now,
-            last_ok_run=now,
-            consecutive_anomalies=0,
-        )
+        state.update(watermark=last_hit.isoformat(), last_alert=now,
+                     last_ok_run=now, consecutive_anomalies=0)
 
     elif canary.found:
         print(f"NO_CHANGE -> still ends {watermark}. Staying quiet.")
@@ -332,17 +352,13 @@ def mode_check(state: dict, notify_enabled: bool) -> dict:
     else:
         n = state.get("consecutive_anomalies", 0) + 1
         state["consecutive_anomalies"] = n
-        print(f"ANOMALY -> not found on {watermark} ({n} in a row). "
-              f"{canary.note}")
+        print(f"ANOMALY -> not found on {watermark} ({n} in a row). {canary.note}")
         if n == 2 and notify_enabled:
-            notify(
-                "Odyssey watch needs attention",
-                f"The film wasn't found on {watermark:%b %d}, a date it "
-                "previously played. Either the Harkins page changed or the "
-                "run was shortened. Worth checking manually.",
-                priority=0,
-                url=theatre_url(watermark),
-            )
+            notify("Odyssey watch needs attention",
+                   f"The film wasn't found on {watermark:%b %d}, a date it "
+                   "previously played. Either the Harkins page changed or the "
+                   "run was shortened. Worth checking manually.",
+                   priority=0, url=theatre_url(watermark))
 
     return state
 
@@ -356,10 +372,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--test-notify", action="store_true")
     ap.add_argument("--diagnose", action="store_true")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="no notifications, no state write")
-    ap.add_argument("--silent", action="store_true",
-                    help="write state, send nothing")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--silent", action="store_true")
     args = ap.parse_args()
 
     if args.test_notify:
