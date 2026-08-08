@@ -1,10 +1,7 @@
 name: odyssey-watch
 
-# ---------------------------------------------------------------------------
 # STAGE 8: to switch the automatic schedule ON, delete the "# " in front of
-# the two lines marked below. Until then this only runs when you press the
-# Run workflow button yourself.
-# ---------------------------------------------------------------------------
+# the two lines marked below.
 
 on:
   # schedule:                        <-- STAGE 8: uncomment this line
@@ -31,7 +28,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -57,13 +54,16 @@ jobs:
             *)                 python monitor.py ;;
           esac
 
-      - name: Attach the diagnostic file
+      - name: Attach the diagnostic files
         if: ${{ inputs.mode == 'diagnose' }}
         uses: actions/upload-artifact@v4
         with:
           name: diagnostic
-          path: diagnostic.txt
+          path: |
+            diagnostic.txt
+            diag-*.png
           retention-days: 7
+          if-no-files-found: warn
 
       - name: Save what it learned
         run: |
@@ -77,8 +77,6 @@ jobs:
             echo "No state change to save."
           fi
 
-      # If the job itself crashes you'd otherwise get silence, which looks
-      # exactly like good news. This makes failure audible.
       - name: Tell me if this job failed
         if: failure()
         run: |
