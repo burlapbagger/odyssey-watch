@@ -4,8 +4,8 @@ name: odyssey-watch
 # the two lines marked below.
 
 on:
-  # schedule:                        <-- STAGE 8: uncomment this line
-  #   - cron: "*/10 * * * *"         <-- STAGE 8: uncomment this line too
+   schedule:                        
+     - cron: "*/10 * * * *"         
 
   workflow_dispatch:
     inputs:
