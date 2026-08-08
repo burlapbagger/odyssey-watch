@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
 """
-odyssey-watch
-=============
-Alerts when Harkins Arizona Mills w/ IMAX posts showtimes for a target film
-beyond a watermark date.
-
-Modes (dropdown in the GitHub Actions tab):
-  check             normal run -- probe for new dates, alert if found
-  test-notification send a test push, prove the alert path works
-  diagnose          save raw page text + screenshots for troubleshooting
+odyssey-watch -- see README. Diagnose mode now also captures the raw HTML
+around the film title, so the premium-format logo (IMAX 70MM) can be
+identified by its alt text rather than by page text, which can't see images.
 """
 
 from __future__ import annotations
@@ -25,10 +19,6 @@ from pathlib import Path
 
 import httpx
 from playwright.sync_api import sync_playwright
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 
 THEATRE_SLUG = os.environ.get("THEATRE_SLUG", "arizona-mills-w-imax")
 BASE_URL = "https://www.harkins.com/theatres/{slug}/{date}"
@@ -57,17 +47,11 @@ TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\s*(?:am|pm)\b", re.I)
 FORMAT_LABEL_RE = re.compile(
     r"\b(IMAX(?:\s*70\s*MM)?|Dolby Cinema|CIN\u00c9XL|CINEXL|Digital)\b", re.I
 )
-
-# A film's rating line, e.g. "R  2h 52m  ALD" -- this is what separates one
-# film's block from the next, and it's how we stop a film's showtime list
-# from bleeding into the next film's times.
 RATING_LINE_RE = re.compile(
     r"\b(?:G|PG|PG-?13|R|NC-?17|NR)\b[^\n]{0,20}\d+h\s*\d+m", re.I
 )
 
 SHOWTIME_SELECTOR = "text=/\\d{1,2}:\\d{2}\\s*(am|pm)/i"
-# Harkins' exact wording when a date has no published schedule, plus the
-# usual variants in case they reword it.
 EMPTY_SELECTOR = (
     "text=/failed to get schedule|no showtimes|not available|"
     "check back|coming soon|too far in the future/i"
@@ -75,11 +59,6 @@ EMPTY_SELECTOR = (
 EMPTY_TEXT_RE = re.compile(
     r"failed to get schedule|too far in the future|no showtimes", re.I
 )
-
-
-# ---------------------------------------------------------------------------
-# Data
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -95,7 +74,8 @@ class DayResult:
     html_len: int = 0
     landed_url: str = ""
     rendered: bool = False
-    schedule_absent: bool = False   # page loaded and said "no schedule"
+    schedule_absent: bool = False
+    film_html: str = ""
 
 
 def load_state() -> dict:
@@ -121,14 +101,6 @@ def theatre_url(day: date) -> str:
 
 
 def film_block(text: str, match: re.Match) -> str:
-    """
-    Return just the target film's block of text.
-
-    Layout is: Title / rating line / genres / [format] / times... / NextTitle /
-    next rating line. So we find this film's rating line, then cut at the NEXT
-    rating line. That boundary sits after our times and before the next
-    film's times.
-    """
     own = RATING_LINE_RE.search(text, match.end())
     if not own:
         return text[match.start(): match.end() + 500]
@@ -137,13 +109,25 @@ def film_block(text: str, match: re.Match) -> str:
     return text[match.start(): end]
 
 
-# ---------------------------------------------------------------------------
-# Scraping
-# ---------------------------------------------------------------------------
+def capture_film_html(page, needle: str) -> str:
+    """
+    Grab the raw HTML of the row containing the film title, walking up a few
+    ancestors so the format logo and its alt text come along.
+    """
+    try:
+        loc = page.get_by_text(re.compile(needle, re.I)).first
+        html = loc.evaluate(
+            "el => { let n = el;"
+            " for (let i = 0; i < 7 && n.parentElement; i++) n = n.parentElement;"
+            " return n.outerHTML; }"
+        )
+        return html[:12000]
+    except Exception as exc:  # noqa: BLE001
+        return f"(could not capture film HTML: {exc})"
 
 
 def probe_day(page, day: date, keep_full_text: bool = False,
-              screenshot: bool = False) -> DayResult:
+              screenshot: bool = False, capture_html: bool = False) -> DayResult:
     url = theatre_url(day)
 
     nav_error = None
@@ -177,7 +161,7 @@ def probe_day(page, day: date, keep_full_text: bool = False,
     text = page.inner_text("body")
     absent = bool(EMPTY_TEXT_RE.search(text))
     if absent:
-        rendered = True   # the page DID load; it just has nothing to show
+        rendered = True
 
     if screenshot:
         page.screenshot(path=f"diag-{day.isoformat()}.png", full_page=True)
@@ -204,13 +188,17 @@ def probe_day(page, day: date, keep_full_text: bool = False,
         note = "schedule exists but target film is not on it"
         if not rendered:
             note = "content never rendered -- possible load problem"
-        return DayResult(day=day, found=False, note=note, **base)
+        # Capture whatever film IS in the IMAX slot, for reference.
+        html = capture_film_html(page, r"IMAX|70\s*MM") if capture_html else ""
+        return DayResult(day=day, found=False, note=note, film_html=html, **base)
 
     block = film_block(text, match)
+    html = capture_film_html(page, TITLE_PATTERN.pattern) if capture_html else ""
 
     if FORMAT_PATTERN and not FORMAT_PATTERN.search(block):
         return DayResult(day=day, found=False, excerpt=block[:400],
-                         note="title found but format filtered out", **base)
+                         note="title found but format filtered out",
+                         film_html=html, **base)
 
     return DayResult(
         day=day,
@@ -218,12 +206,13 @@ def probe_day(page, day: date, keep_full_text: bool = False,
         times=TIME_RE.findall(block),
         formats=sorted(set(FORMAT_LABEL_RE.findall(block))),
         excerpt=block[:700],
+        film_html=html,
         **base,
     )
 
 
 def scan(days: list[date], keep_full_text: bool = False,
-         screenshot: bool = False) -> list[DayResult]:
+         screenshot: bool = False, capture_html: bool = False) -> list[DayResult]:
     results: list[DayResult] = []
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -238,18 +227,15 @@ def scan(days: list[date], keep_full_text: bool = False,
         page = ctx.new_page()
         for d in days:
             try:
-                results.append(probe_day(page, d, keep_full_text, screenshot))
+                results.append(
+                    probe_day(page, d, keep_full_text, screenshot, capture_html)
+                )
             except Exception as exc:  # noqa: BLE001
                 print(f"warn: probe failed for {d}: {exc}", file=sys.stderr)
                 results.append(DayResult(day=d, found=False, note=f"error: {exc}"))
             time.sleep(PAGE_DELAY_SEC)
         browser.close()
     return results
-
-
-# ---------------------------------------------------------------------------
-# Notification
-# ---------------------------------------------------------------------------
 
 
 def notify(title: str, message: str, priority: int = 0, url: str = "") -> None:
@@ -280,11 +266,6 @@ def notify(title: str, message: str, priority: int = 0, url: str = "") -> None:
     print("Pushover accepted the message.")
 
 
-# ---------------------------------------------------------------------------
-# Modes
-# ---------------------------------------------------------------------------
-
-
 def mode_test_notify() -> int:
     print("Sending a test notification...")
     if not (PUSHOVER_TOKEN and PUSHOVER_USER):
@@ -298,12 +279,10 @@ def mode_test_notify() -> int:
 
 
 def mode_diagnose(watermark: date) -> int:
-    days = [watermark, watermark + timedelta(days=1),
-            watermark + timedelta(days=2)]
-    print(f"Diagnosing {days[0]} (should HAVE showtimes) then "
-          f"{days[1]} and {days[2]} (should NOT, yet)")
+    days = [watermark, watermark + timedelta(days=1)]
+    print(f"Diagnosing {days[0]} (Odyssey in IMAX 70MM) and {days[1]}")
 
-    results = scan(days, keep_full_text=True, screenshot=True)
+    results = scan(days, keep_full_text=True, screenshot=True, capture_html=True)
 
     chunks = ["ODYSSEY-WATCH DIAGNOSTIC", f"generated: {datetime.now()}", ""]
     for r in results:
@@ -311,7 +290,6 @@ def mode_diagnose(watermark: date) -> int:
             "=" * 70,
             f"DATE:        {r.day}",
             f"LANDED ON:   {r.landed_url or '-'}",
-            f"HTML SIZE:   {r.html_len}",
             f"RENDERED:    {r.rendered}",
             f"NO SCHEDULE: {r.schedule_absent}",
             f"FOUND:       {r.found}",
@@ -319,18 +297,17 @@ def mode_diagnose(watermark: date) -> int:
             f"TIMES:       {', '.join(r.times) or '-'}",
             f"FORMATS:     {', '.join(r.formats) or '-'}",
             "",
-            "--- film block ---",
+            "--- film block (text) ---",
             r.excerpt or "(nothing matched)",
             "",
-            "--- full page text (first 15000 chars) ---",
-            (r.full_text or "(empty)")[:15000],
+            "--- FILM ROW HTML (this is the important part) ---",
+            r.film_html or "(not captured)",
             "",
         ]
-        print(f"  {r.day}: found={r.found} absent={r.schedule_absent} "
-              f"times={len(r.times)} {r.note}")
+        print(f"  {r.day}: found={r.found} html={len(r.film_html)} {r.note}")
 
     DIAGNOSTIC_PATH.write_text("\n".join(chunks))
-    print(f"\nWrote {DIAGNOSTIC_PATH} plus screenshots. Download from Artifacts.")
+    print(f"\nWrote {DIAGNOSTIC_PATH}. Download from Artifacts.")
     return 0
 
 
@@ -346,8 +323,6 @@ def mode_check(state: dict, notify_enabled: bool) -> dict:
     after = [r for r in results[1:] if r.found]
     now = datetime.now().astimezone().isoformat(timespec="seconds")
 
-    # Record how far out Harkins publishes ANY schedule. If this number
-    # climbs by one every day, they use a rolling booking window.
     published = [r.day for r in results if not r.schedule_absent and r.rendered]
     if published:
         state["furthest_schedule_seen"] = max(published).isoformat()
@@ -365,14 +340,16 @@ def mode_check(state: dict, notify_enabled: bool) -> dict:
         lines = []
         for r in sorted(after, key=lambda x: x.day):
             times = ", ".join(r.times) or "(times not parsed)"
-            lines.append(f"<b>{r.day:%a %b %d}</b>\n{times}")
+            fmt = "/".join(r.formats) if r.formats else "premium format"
+            lines.append(f"<b>{r.day:%a %b %d}</b> ({fmt})\n{times}")
 
         body = (f"New dates are live past {watermark:%b %d}.\n\n"
                 + "\n\n".join(lines)
-                + f"\n\nNew last date: {last_hit:%b %d}")
+                + f"\n\nNew last date: {last_hit:%b %d}"
+                + "\n\nCheck the auditorium before buying.")
         print(f"EXTENDED -> new horizon {last_hit}")
         if notify_enabled:
-            notify("Odyssey extended - AZ Mills IMAX", body, priority=1,
+            notify("Odyssey extended - AZ Mills", body, priority=1,
                    url=theatre_url(min(r.day for r in after)))
 
         state.update(watermark=last_hit.isoformat(), last_alert=now,
@@ -394,11 +371,6 @@ def mode_check(state: dict, notify_enabled: bool) -> dict:
                    priority=0, url=theatre_url(watermark))
 
     return state
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 
 def main() -> int:
