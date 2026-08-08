@@ -1,13 +1,8 @@
 name: odyssey-watch
 
-# STAGE 8: to switch the automatic schedule ON, delete the "# " in front of
-# the two lines marked below.
-
 on:
   schedule:
     - cron: "*/10 * * * *"
-
-  workflow_dispatch:        
 
   workflow_dispatch:
     inputs:
