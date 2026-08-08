@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-odyssey-watch -- see README. Diagnose mode now also captures the raw HTML
-around the film title, so the premium-format logo (IMAX 70MM) can be
-identified by its alt text rather than by page text, which can't see images.
+odyssey-watch -- diagnose mode now inspects page structure directly to find
+the premium-format marker (IMAX 70MM), which renders as a logo image and is
+therefore invisible to text extraction.
 """
 
 from __future__ import annotations
@@ -60,6 +60,38 @@ EMPTY_TEXT_RE = re.compile(
     r"failed to get schedule|too far in the future|no showtimes", re.I
 )
 
+# JavaScript run inside the page. Finds the smallest element whose text
+# contains the film title AND a showtime, then returns its HTML. Also
+# collects every image alt/src near it -- the format logo lives there.
+INSPECT_JS = """
+(needle) => {
+  const rx = new RegExp(needle, 'i');
+  const timeRx = /\\d{1,2}:\\d{2}\\s*(am|pm)/i;
+  const out = { row: null, images: [], testids: [], candidates: 0 };
+
+  const all = Array.from(document.querySelectorAll('div,section,article,li'));
+  let best = null;
+  for (const el of all) {
+    const t = el.innerText || '';
+    if (rx.test(t) && timeRx.test(t)) {
+      out.candidates++;
+      if (!best || el.innerText.length < best.innerText.length) best = el;
+    }
+  }
+  if (best) {
+    out.row = best.outerHTML.slice(0, 9000);
+    out.images = Array.from(best.querySelectorAll('img')).map(i => ({
+      alt: i.alt || '', src: (i.src || '').split('/').pop().slice(0, 120)
+    }));
+  }
+  out.testids = Array.from(
+    new Set(Array.from(document.querySelectorAll('[data-testid]'))
+      .map(e => e.getAttribute('data-testid')))
+  ).slice(0, 60);
+  return out;
+}
+"""
+
 
 @dataclass
 class DayResult:
@@ -75,7 +107,7 @@ class DayResult:
     landed_url: str = ""
     rendered: bool = False
     schedule_absent: bool = False
-    film_html: str = ""
+    inspect: dict = field(default_factory=dict)
 
 
 def load_state() -> dict:
@@ -109,25 +141,8 @@ def film_block(text: str, match: re.Match) -> str:
     return text[match.start(): end]
 
 
-def capture_film_html(page, needle: str) -> str:
-    """
-    Grab the raw HTML of the row containing the film title, walking up a few
-    ancestors so the format logo and its alt text come along.
-    """
-    try:
-        loc = page.get_by_text(re.compile(needle, re.I)).first
-        html = loc.evaluate(
-            "el => { let n = el;"
-            " for (let i = 0; i < 7 && n.parentElement; i++) n = n.parentElement;"
-            " return n.outerHTML; }"
-        )
-        return html[:12000]
-    except Exception as exc:  # noqa: BLE001
-        return f"(could not capture film HTML: {exc})"
-
-
 def probe_day(page, day: date, keep_full_text: bool = False,
-              screenshot: bool = False, capture_html: bool = False) -> DayResult:
+              screenshot: bool = False, inspect: bool = False) -> DayResult:
     url = theatre_url(day)
 
     nav_error = None
@@ -166,6 +181,13 @@ def probe_day(page, day: date, keep_full_text: bool = False,
     if screenshot:
         page.screenshot(path=f"diag-{day.isoformat()}.png", full_page=True)
 
+    inspect_data = {}
+    if inspect:
+        try:
+            inspect_data = page.evaluate(INSPECT_JS, TITLE_PATTERN.pattern)
+        except Exception as exc:  # noqa: BLE001
+            inspect_data = {"error": str(exc)}
+
     base = dict(
         full_text=text if keep_full_text else "",
         page_title=page.title(),
@@ -173,6 +195,7 @@ def probe_day(page, day: date, keep_full_text: bool = False,
         landed_url=page.url,
         rendered=rendered,
         schedule_absent=absent,
+        inspect=inspect_data,
     )
 
     if day.isoformat() not in page.url:
@@ -188,17 +211,13 @@ def probe_day(page, day: date, keep_full_text: bool = False,
         note = "schedule exists but target film is not on it"
         if not rendered:
             note = "content never rendered -- possible load problem"
-        # Capture whatever film IS in the IMAX slot, for reference.
-        html = capture_film_html(page, r"IMAX|70\s*MM") if capture_html else ""
-        return DayResult(day=day, found=False, note=note, film_html=html, **base)
+        return DayResult(day=day, found=False, note=note, **base)
 
     block = film_block(text, match)
-    html = capture_film_html(page, TITLE_PATTERN.pattern) if capture_html else ""
 
     if FORMAT_PATTERN and not FORMAT_PATTERN.search(block):
         return DayResult(day=day, found=False, excerpt=block[:400],
-                         note="title found but format filtered out",
-                         film_html=html, **base)
+                         note="title found but format filtered out", **base)
 
     return DayResult(
         day=day,
@@ -206,13 +225,12 @@ def probe_day(page, day: date, keep_full_text: bool = False,
         times=TIME_RE.findall(block),
         formats=sorted(set(FORMAT_LABEL_RE.findall(block))),
         excerpt=block[:700],
-        film_html=html,
         **base,
     )
 
 
 def scan(days: list[date], keep_full_text: bool = False,
-         screenshot: bool = False, capture_html: bool = False) -> list[DayResult]:
+         screenshot: bool = False, inspect: bool = False) -> list[DayResult]:
     results: list[DayResult] = []
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -228,7 +246,7 @@ def scan(days: list[date], keep_full_text: bool = False,
         for d in days:
             try:
                 results.append(
-                    probe_day(page, d, keep_full_text, screenshot, capture_html)
+                    probe_day(page, d, keep_full_text, screenshot, inspect)
                 )
             except Exception as exc:  # noqa: BLE001
                 print(f"warn: probe failed for {d}: {exc}", file=sys.stderr)
@@ -279,32 +297,36 @@ def mode_test_notify() -> int:
 
 
 def mode_diagnose(watermark: date) -> int:
-    days = [watermark, watermark + timedelta(days=1)]
-    print(f"Diagnosing {days[0]} (Odyssey in IMAX 70MM) and {days[1]}")
-
-    results = scan(days, keep_full_text=True, screenshot=True, capture_html=True)
+    print(f"Inspecting {watermark} for the IMAX 70MM marker")
+    results = scan([watermark], keep_full_text=False,
+                   screenshot=True, inspect=True)
 
     chunks = ["ODYSSEY-WATCH DIAGNOSTIC", f"generated: {datetime.now()}", ""]
     for r in results:
+        ins = r.inspect or {}
         chunks += [
             "=" * 70,
-            f"DATE:        {r.day}",
-            f"LANDED ON:   {r.landed_url or '-'}",
-            f"RENDERED:    {r.rendered}",
-            f"NO SCHEDULE: {r.schedule_absent}",
-            f"FOUND:       {r.found}",
-            f"NOTE:        {r.note or '-'}",
-            f"TIMES:       {', '.join(r.times) or '-'}",
-            f"FORMATS:     {', '.join(r.formats) or '-'}",
+            f"DATE:      {r.day}",
+            f"FOUND:     {r.found}",
+            f"TIMES:     {', '.join(r.times) or '-'}",
+            f"NOTE:      {r.note or '-'}",
+            f"CANDIDATES:{ins.get('candidates', '-')}",
             "",
-            "--- film block (text) ---",
-            r.excerpt or "(nothing matched)",
+            "--- IMAGES IN THE FILM ROW (alt text + filename) ---",
+            json.dumps(ins.get("images", []), indent=2),
             "",
-            "--- FILM ROW HTML (this is the important part) ---",
-            r.film_html or "(not captured)",
+            "--- DATA-TESTIDS ON THE PAGE ---",
+            json.dumps(ins.get("testids", []), indent=2),
+            "",
+            "--- FILM ROW HTML ---",
+            ins.get("row") or ins.get("error") or "(not captured)",
             "",
         ]
-        print(f"  {r.day}: found={r.found} html={len(r.film_html)} {r.note}")
+        imgs = ins.get("images", [])
+        print(f"  {r.day}: found={r.found} images={len(imgs)} "
+              f"candidates={ins.get('candidates')}")
+        for i in imgs:
+            print(f"    img alt={i.get('alt')!r} src={i.get('src')!r}")
 
     DIAGNOSTIC_PATH.write_text("\n".join(chunks))
     print(f"\nWrote {DIAGNOSTIC_PATH}. Download from Artifacts.")
@@ -340,13 +362,12 @@ def mode_check(state: dict, notify_enabled: bool) -> dict:
         lines = []
         for r in sorted(after, key=lambda x: x.day):
             times = ", ".join(r.times) or "(times not parsed)"
-            fmt = "/".join(r.formats) if r.formats else "premium format"
-            lines.append(f"<b>{r.day:%a %b %d}</b> ({fmt})\n{times}")
+            lines.append(f"<b>{r.day:%a %b %d}</b>\n{times}")
 
         body = (f"New dates are live past {watermark:%b %d}.\n\n"
                 + "\n\n".join(lines)
                 + f"\n\nNew last date: {last_hit:%b %d}"
-                + "\n\nCheck the auditorium before buying.")
+                + "\n\nConfirm it's the IMAX auditorium before buying.")
         print(f"EXTENDED -> new horizon {last_hit}")
         if notify_enabled:
             notify("Odyssey extended - AZ Mills", body, priority=1,
