@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 """
-odyssey-watch -- diagnose mode now inspects page structure directly to find
-the premium-format marker (IMAX 70MM), which renders as a logo image and is
-therefore invisible to text extraction.
+odyssey-watch
+=============
+Alerts when Harkins Arizona Mills w/ IMAX posts NEW showtimes for The Odyssey
+in IMAX 70mm beyond a watermark date.
+
+Detection is structural. Harkins renders each film as a row containing one
+"movie-showtime-category" block per format, and the format itself is a logo
+image identified by alt="IMAX 70mm", class "imaxSeventymm", and a src ending
+in IMAX70MM. We read that, so a digital-only listing will not trigger an alert.
+
+If the structural parse fails but the title appears in the page text, we still
+alert -- flagged as unconfirmed format. Missing the real thing is worse than
+an occasional imprecise alert.
 """
 
 from __future__ import annotations
@@ -20,13 +30,25 @@ from pathlib import Path
 import httpx
 from playwright.sync_api import sync_playwright
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
 THEATRE_SLUG = os.environ.get("THEATRE_SLUG", "arizona-mills-w-imax")
 BASE_URL = "https://www.harkins.com/theatres/{slug}/{date}"
 
 TITLE_PATTERN = re.compile(os.environ.get("TITLE_PATTERN", r"odyssey"), re.I)
 
-_fmt = os.environ.get("FORMAT_PATTERN", "").strip()
-FORMAT_PATTERN = re.compile(_fmt, re.I) if _fmt else None
+# The premium format we care about. Matched against the logo image's alt
+# text, class name, and src -- any one hit counts.
+PREMIUM_PATTERN = re.compile(
+    os.environ.get("PREMIUM_PATTERN", r"imax\s*70\s*mm|imaxseventymm|IMAX70MM"),
+    re.I,
+)
+
+# Set REQUIRE_PREMIUM=false to alert on ANY format (useful if the 70mm run
+# ends and you'd take a digital showing instead).
+REQUIRE_PREMIUM = os.environ.get("REQUIRE_PREMIUM", "true").lower() != "false"
 
 DEFAULT_WATERMARK = os.environ.get("WATERMARK", "2026-09-16")
 PROBE_DAYS = int(os.environ.get("PROBE_DAYS", "7"))
@@ -43,14 +65,6 @@ CONTENT_TIMEOUT_MS = int(os.environ.get("CONTENT_TIMEOUT_MS", "20000"))
 SETTLE_MS = int(os.environ.get("SETTLE_MS", "3000"))
 PAGE_DELAY_SEC = float(os.environ.get("PAGE_DELAY_SEC", "1.5"))
 
-TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\s*(?:am|pm)\b", re.I)
-FORMAT_LABEL_RE = re.compile(
-    r"\b(IMAX(?:\s*70\s*MM)?|Dolby Cinema|CIN\u00c9XL|CINEXL|Digital)\b", re.I
-)
-RATING_LINE_RE = re.compile(
-    r"\b(?:G|PG|PG-?13|R|NC-?17|NR)\b[^\n]{0,20}\d+h\s*\d+m", re.I
-)
-
 SHOWTIME_SELECTOR = "text=/\\d{1,2}:\\d{2}\\s*(am|pm)/i"
 EMPTY_SELECTOR = (
     "text=/failed to get schedule|no showtimes|not available|"
@@ -60,37 +74,47 @@ EMPTY_TEXT_RE = re.compile(
     r"failed to get schedule|too far in the future|no showtimes", re.I
 )
 
-# JavaScript run inside the page. Finds the smallest element whose text
-# contains the film title AND a showtime, then returns its HTML. Also
-# collects every image alt/src near it -- the format logo lives there.
-INSPECT_JS = """
+# Runs inside the page. Finds the film row, then walks its format categories.
+EXTRACT_JS = """
 (needle) => {
   const rx = new RegExp(needle, 'i');
-  const timeRx = /\\d{1,2}:\\d{2}\\s*(am|pm)/i;
-  const out = { row: null, images: [], testids: [], candidates: 0 };
+  const out = { rowFound: false, categories: [], titleInText: false };
 
-  const all = Array.from(document.querySelectorAll('div,section,article,li'));
-  let best = null;
-  for (const el of all) {
-    const t = el.innerText || '';
-    if (rx.test(t) && timeRx.test(t)) {
-      out.candidates++;
-      if (!best || el.innerText.length < best.innerText.length) best = el;
-    }
+  out.titleInText = rx.test(document.body.innerText || '');
+
+  // Film titles render as an h4 with role="link".
+  let heading = Array.from(document.querySelectorAll('h4'))
+    .find(h => rx.test(h.textContent || ''));
+  if (!heading) return out;
+
+  // Walk up until we find an ancestor holding the showtime categories.
+  let row = heading;
+  for (let i = 0; i < 8 && row.parentElement; i++) {
+    row = row.parentElement;
+    if (row.querySelector('[data-testid="movie-showtime-category"]')) break;
   }
-  if (best) {
-    out.row = best.outerHTML.slice(0, 9000);
-    out.images = Array.from(best.querySelectorAll('img')).map(i => ({
-      alt: i.alt || '', src: (i.src || '').split('/').pop().slice(0, 120)
-    }));
+  const cats = row.querySelectorAll('[data-testid="movie-showtime-category"]');
+  if (!cats.length) return out;
+  out.rowFound = true;
+
+  for (const cat of cats) {
+    const img = cat.querySelector('img');
+    const label =
+      (img ? [img.alt || '', img.className || '', img.src || ''].join(' ') : '')
+      || (cat.innerText || '').split('\\n')[0];
+    const times = Array.from(cat.querySelectorAll('a'))
+      .filter(a => /\\d{1,2}:\\d{2}\\s*(am|pm)/i.test(a.textContent || ''))
+      .map(a => ({ time: a.textContent.trim(), href: a.href }));
+    if (times.length) out.categories.push({ label: label.trim(), times });
   }
-  out.testids = Array.from(
-    new Set(Array.from(document.querySelectorAll('[data-testid]'))
-      .map(e => e.getAttribute('data-testid')))
-  ).slice(0, 60);
   return out;
 }
 """
+
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -98,16 +122,14 @@ class DayResult:
     day: date
     found: bool
     times: list[str] = field(default_factory=list)
-    formats: list[str] = field(default_factory=list)
-    excerpt: str = ""
-    full_text: str = ""
+    format_label: str = ""
+    booking_url: str = ""
+    premium_confirmed: bool = False
     note: str = ""
-    page_title: str = ""
-    html_len: int = 0
     landed_url: str = ""
     rendered: bool = False
     schedule_absent: bool = False
-    inspect: dict = field(default_factory=dict)
+    raw: dict = field(default_factory=dict)
 
 
 def load_state() -> dict:
@@ -132,17 +154,12 @@ def theatre_url(day: date) -> str:
     return BASE_URL.format(slug=THEATRE_SLUG, date=day.isoformat())
 
 
-def film_block(text: str, match: re.Match) -> str:
-    own = RATING_LINE_RE.search(text, match.end())
-    if not own:
-        return text[match.start(): match.end() + 500]
-    nxt = RATING_LINE_RE.search(text, own.end())
-    end = nxt.start() if nxt else min(len(text), own.end() + 500)
-    return text[match.start(): end]
+# ---------------------------------------------------------------------------
+# Scraping
+# ---------------------------------------------------------------------------
 
 
-def probe_day(page, day: date, keep_full_text: bool = False,
-              screenshot: bool = False, inspect: bool = False) -> DayResult:
+def probe_day(page, day: date, screenshot: bool = False) -> DayResult:
     url = theatre_url(day)
 
     nav_error = None
@@ -181,22 +198,13 @@ def probe_day(page, day: date, keep_full_text: bool = False,
     if screenshot:
         page.screenshot(path=f"diag-{day.isoformat()}.png", full_page=True)
 
-    inspect_data = {}
-    if inspect:
-        try:
-            inspect_data = page.evaluate(INSPECT_JS, TITLE_PATTERN.pattern)
-        except Exception as exc:  # noqa: BLE001
-            inspect_data = {"error": str(exc)}
+    try:
+        data = page.evaluate(EXTRACT_JS, TITLE_PATTERN.pattern)
+    except Exception as exc:  # noqa: BLE001
+        data = {"error": str(exc), "categories": [], "titleInText": False}
 
-    base = dict(
-        full_text=text if keep_full_text else "",
-        page_title=page.title(),
-        html_len=len(page.content()),
-        landed_url=page.url,
-        rendered=rendered,
-        schedule_absent=absent,
-        inspect=inspect_data,
-    )
+    base = dict(landed_url=page.url, rendered=rendered,
+                schedule_absent=absent, raw=data)
 
     if day.isoformat() not in page.url:
         return DayResult(day=day, found=False,
@@ -206,31 +214,46 @@ def probe_day(page, day: date, keep_full_text: bool = False,
         return DayResult(day=day, found=False,
                          note="no schedule published for this date yet", **base)
 
-    match = TITLE_PATTERN.search(text)
-    if not match:
-        note = "schedule exists but target film is not on it"
-        if not rendered:
-            note = "content never rendered -- possible load problem"
-        return DayResult(day=day, found=False, note=note, **base)
+    cats = data.get("categories", [])
 
-    block = film_block(text, match)
+    # Prefer a category whose format logo says IMAX 70mm.
+    premium = [c for c in cats if PREMIUM_PATTERN.search(c.get("label", ""))]
+    chosen = premium[0] if premium else (cats[0] if cats and not REQUIRE_PREMIUM
+                                         else None)
 
-    if FORMAT_PATTERN and not FORMAT_PATTERN.search(block):
-        return DayResult(day=day, found=False, excerpt=block[:400],
-                         note="title found but format filtered out", **base)
+    if chosen:
+        times = [t["time"] for t in chosen["times"]]
+        return DayResult(
+            day=day, found=True, times=times,
+            format_label="IMAX 70mm" if premium else chosen.get("label", "")[:40],
+            booking_url=chosen["times"][0]["href"] if chosen["times"] else "",
+            premium_confirmed=bool(premium),
+            note="", **base,
+        )
 
-    return DayResult(
-        day=day,
-        found=True,
-        times=TIME_RE.findall(block),
-        formats=sorted(set(FORMAT_LABEL_RE.findall(block))),
-        excerpt=block[:700],
-        **base,
-    )
+    if cats:
+        labels = ", ".join(c.get("label", "")[:30] for c in cats)
+        return DayResult(day=day, found=False,
+                         note=f"film present but not in 70mm (formats: {labels})",
+                         **base)
+
+    # Structural parse found nothing. Fall back to text so a layout change
+    # can't silence us completely.
+    if data.get("titleInText"):
+        return DayResult(day=day, found=True, times=[],
+                         format_label="unconfirmed",
+                         booking_url=theatre_url(day),
+                         premium_confirmed=False,
+                         note="FALLBACK: title in page text but structure "
+                              "not parsed -- verify manually", **base)
+
+    note = "schedule exists but target film is not on it"
+    if not rendered:
+        note = "content never rendered -- possible load problem"
+    return DayResult(day=day, found=False, note=note, **base)
 
 
-def scan(days: list[date], keep_full_text: bool = False,
-         screenshot: bool = False, inspect: bool = False) -> list[DayResult]:
+def scan(days: list[date], screenshot: bool = False) -> list[DayResult]:
     results: list[DayResult] = []
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -245,9 +268,7 @@ def scan(days: list[date], keep_full_text: bool = False,
         page = ctx.new_page()
         for d in days:
             try:
-                results.append(
-                    probe_day(page, d, keep_full_text, screenshot, inspect)
-                )
+                results.append(probe_day(page, d, screenshot))
             except Exception as exc:  # noqa: BLE001
                 print(f"warn: probe failed for {d}: {exc}", file=sys.stderr)
                 results.append(DayResult(day=d, found=False, note=f"error: {exc}"))
@@ -256,7 +277,13 @@ def scan(days: list[date], keep_full_text: bool = False,
     return results
 
 
-def notify(title: str, message: str, priority: int = 0, url: str = "") -> None:
+# ---------------------------------------------------------------------------
+# Notification
+# ---------------------------------------------------------------------------
+
+
+def notify(title: str, message: str, priority: int = 0, url: str = "",
+           url_title: str = "Open Harkins") -> None:
     if not (PUSHOVER_TOKEN and PUSHOVER_USER):
         print("!! No Pushover credentials found. Would have sent:")
         print(f"   {title}\n   {message}")
@@ -272,7 +299,7 @@ def notify(title: str, message: str, priority: int = 0, url: str = "") -> None:
     }
     if url:
         payload["url"] = url
-        payload["url_title"] = "Open Harkins"
+        payload["url_title"] = url_title
     if priority == 1:
         payload["sound"] = "persistent"
 
@@ -282,6 +309,11 @@ def notify(title: str, message: str, priority: int = 0, url: str = "") -> None:
         print(f"!! Pushover rejected the message: {r.status_code} {r.text}")
     r.raise_for_status()
     print("Pushover accepted the message.")
+
+
+# ---------------------------------------------------------------------------
+# Modes
+# ---------------------------------------------------------------------------
 
 
 def mode_test_notify() -> int:
@@ -297,36 +329,28 @@ def mode_test_notify() -> int:
 
 
 def mode_diagnose(watermark: date) -> int:
-    print(f"Inspecting {watermark} for the IMAX 70MM marker")
-    results = scan([watermark], keep_full_text=False,
-                   screenshot=True, inspect=True)
+    days = [watermark, watermark + timedelta(days=1)]
+    print(f"Diagnosing {days[0]} and {days[1]}")
+    results = scan(days, screenshot=True)
 
     chunks = ["ODYSSEY-WATCH DIAGNOSTIC", f"generated: {datetime.now()}", ""]
     for r in results:
-        ins = r.inspect or {}
         chunks += [
             "=" * 70,
-            f"DATE:      {r.day}",
-            f"FOUND:     {r.found}",
-            f"TIMES:     {', '.join(r.times) or '-'}",
-            f"NOTE:      {r.note or '-'}",
-            f"CANDIDATES:{ins.get('candidates', '-')}",
+            f"DATE:        {r.day}",
+            f"FOUND:       {r.found}",
+            f"70MM:        {r.premium_confirmed}",
+            f"FORMAT:      {r.format_label or '-'}",
+            f"TIMES:       {', '.join(r.times) or '-'}",
+            f"BOOKING URL: {r.booking_url or '-'}",
+            f"NOTE:        {r.note or '-'}",
             "",
-            "--- IMAGES IN THE FILM ROW (alt text + filename) ---",
-            json.dumps(ins.get("images", []), indent=2),
-            "",
-            "--- DATA-TESTIDS ON THE PAGE ---",
-            json.dumps(ins.get("testids", []), indent=2),
-            "",
-            "--- FILM ROW HTML ---",
-            ins.get("row") or ins.get("error") or "(not captured)",
+            "--- extracted structure ---",
+            json.dumps(r.raw, indent=2)[:6000],
             "",
         ]
-        imgs = ins.get("images", [])
-        print(f"  {r.day}: found={r.found} images={len(imgs)} "
-              f"candidates={ins.get('candidates')}")
-        for i in imgs:
-            print(f"    img alt={i.get('alt')!r} src={i.get('src')!r}")
+        print(f"  {r.day}: found={r.found} 70mm={r.premium_confirmed} "
+              f"times={r.times} {r.note}")
 
     DIAGNOSTIC_PATH.write_text("\n".join(chunks))
     print(f"\nWrote {DIAGNOSTIC_PATH}. Download from Artifacts.")
@@ -359,25 +383,33 @@ def mode_check(state: dict, notify_enabled: bool) -> dict:
             after.extend(hits)
             last_hit = max(r.day for r in hits)
 
+        confirmed = all(r.premium_confirmed for r in after)
         lines = []
         for r in sorted(after, key=lambda x: x.day):
-            times = ", ".join(r.times) or "(times not parsed)"
-            lines.append(f"<b>{r.day:%a %b %d}</b>\n{times}")
+            times = ", ".join(r.times) or "(see page)"
+            lines.append(f"<b>{r.day:%a %b %d}</b> — {r.format_label}\n{times}")
 
-        body = (f"New dates are live past {watermark:%b %d}.\n\n"
-                + "\n\n".join(lines)
-                + f"\n\nNew last date: {last_hit:%b %d}"
-                + "\n\nConfirm it's the IMAX auditorium before buying.")
-        print(f"EXTENDED -> new horizon {last_hit}")
+        body = ("\n\n".join(lines) + f"\n\nRuns through {last_hit:%b %d}")
+        if not confirmed:
+            body += "\n\n(Format unconfirmed — verify it's the IMAX auditorium.)"
+
+        title = ("Odyssey 70mm extended - AZ Mills" if confirmed
+                 else "Odyssey dates added - AZ Mills")
+        first = min(after, key=lambda x: x.day)
+
+        print(f"EXTENDED -> new horizon {last_hit}, 70mm={confirmed}")
         if notify_enabled:
-            notify("Odyssey extended - AZ Mills", body, priority=1,
-                   url=theatre_url(min(r.day for r in after)))
+            notify(title, body, priority=1,
+                   url=first.booking_url or theatre_url(first.day),
+                   url_title="Buy tickets")
 
         state.update(watermark=last_hit.isoformat(), last_alert=now,
                      last_ok_run=now, consecutive_anomalies=0)
 
     elif canary.found:
-        print(f"NO_CHANGE -> still ends {watermark}. Staying quiet.")
+        print(f"NO_CHANGE -> still ends {watermark} "
+              f"({len(canary.times)} times, 70mm={canary.premium_confirmed}). "
+              "Staying quiet.")
         state.update(last_ok_run=now, consecutive_anomalies=0)
 
     else:
@@ -386,12 +418,17 @@ def mode_check(state: dict, notify_enabled: bool) -> dict:
         print(f"ANOMALY -> not found on {watermark} ({n} in a row). {canary.note}")
         if n == 2 and notify_enabled:
             notify("Odyssey watch needs attention",
-                   f"The film wasn't found on {watermark:%b %d}, a date it "
-                   "previously played. Either the Harkins page changed or the "
-                   "run was shortened. Worth checking manually.",
+                   f"The film wasn't found in 70mm on {watermark:%b %d}, a date "
+                   "it previously played. Either the Harkins page changed or "
+                   "the run was shortened. Worth checking manually.",
                    priority=0, url=theatre_url(watermark))
 
     return state
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 
 def main() -> int:
