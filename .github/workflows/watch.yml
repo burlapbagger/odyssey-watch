@@ -1,0 +1,90 @@
+name: odyssey-watch
+
+# ---------------------------------------------------------------------------
+# STAGE 8: to switch the automatic schedule ON, delete the "# " in front of
+# the two lines marked below. Until then this only runs when you press the
+# Run workflow button yourself.
+# ---------------------------------------------------------------------------
+
+on:
+  # schedule:                        <-- STAGE 8: uncomment this line
+  #   - cron: "*/10 * * * *"         <-- STAGE 8: uncomment this line too
+
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "What should this run do?"
+        type: choice
+        default: check
+        options:
+          - check
+          - test-notification
+          - diagnose
+
+concurrency:
+  group: odyssey-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: Run the watcher
+        env:
+          PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
+          PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          case "$MODE" in
+            test-notification) python monitor.py --test-notify ;;
+            diagnose)          python monitor.py --diagnose ;;
+            *)                 python monitor.py ;;
+          esac
+
+      - name: Attach the diagnostic file
+        if: ${{ inputs.mode == 'diagnose' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic
+          path: diagnostic.txt
+          retention-days: 7
+
+      - name: Save what it learned
+        run: |
+          if [[ -n "$(git status --porcelain state.json)" ]]; then
+            git config user.name "odyssey-watch"
+            git config user.email "actions@users.noreply.github.com"
+            git add state.json
+            git commit -m "state: update $(date -u +%F' '%T)"
+            git push
+          else
+            echo "No state change to save."
+          fi
+
+      # If the job itself crashes you'd otherwise get silence, which looks
+      # exactly like good news. This makes failure audible.
+      - name: Tell me if this job failed
+        if: failure()
+        run: |
+          curl -s -X POST https://api.pushover.net/1/messages.json \
+            -d token="${{ secrets.PUSHOVER_TOKEN }}" \
+            -d user="${{ secrets.PUSHOVER_USER }}" \
+            -d title="odyssey-watch job failed" \
+            -d message="The workflow errored out. Open the Actions tab to see why." \
+            -d url="https://github.com/${{ github.repository }}/actions"
