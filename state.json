@@ -1,5 +1,5 @@
 {
-  "consecutive_anomalies": 0,
+  "consecutive_anomalies": 1,
   "furthest_schedule_seen": "2026-10-07",
   "last_alert": "2026-09-03T16:17:18+00:00",
   "last_ok_run": "2026-09-05T09:01:06+00:00",
